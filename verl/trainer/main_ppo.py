@@ -115,6 +115,24 @@ class TaskRunner:
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker based on the actor strategy."""
         from verl.single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.ray_trainer import Role
+
+        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        if use_legacy_worker_impl == "disable":
+            from verl.workers.engine_workers import ActorRolloutRefWorker
+
+            actor_rollout_cls = ActorRolloutRefWorker
+            role = (
+                Role.ActorRolloutRef
+                if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+                else Role.ActorRollout
+            )
+            self.role_worker_mapping[role] = ray.remote(actor_rollout_cls)
+            self.mapping[role] = "global_pool"
+            print("Using new actor-rollout worker implementation")
+            return actor_rollout_cls, RayWorkerGroup
+        if use_legacy_worker_impl not in ["auto", "enable"]:
+            raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
@@ -139,30 +157,27 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.trainer.ppo.ray_trainer import Role
-
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
+        self.mapping[Role.ActorRollout] = "global_pool"
 
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
-        if config.critic.strategy in {"fsdp", "fsdp2"}:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable"]:
+        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        if use_legacy_worker_impl in ["auto", "enable"]:
+            if config.critic.strategy in {"fsdp", "fsdp2"}:
                 from verl.workers.fsdp_workers import CriticWorker
-            elif use_legacy_worker_impl == "disable":
-                from verl.workers.roles import CriticWorker
-
-                print("Using new worker implementation")
+            elif config.critic.strategy == "megatron":
+                from verl.workers.megatron_workers import CriticWorker
             else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+                raise NotImplementedError
+        elif use_legacy_worker_impl == "disable":
+            from verl.workers.roles import CriticWorker
 
-        elif config.critic.strategy == "megatron":
-            from verl.workers.megatron_workers import CriticWorker
-
+            print("Using new worker implementation")
         else:
-            raise NotImplementedError
+            raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
         from verl.trainer.ppo.ray_trainer import Role
 
@@ -186,8 +201,8 @@ class TaskRunner:
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
 
-        self.mapping[Role.ActorRollout] = global_pool_id
-        self.mapping[Role.Critic] = global_pool_id
+        self.mapping.setdefault(Role.ActorRollout, global_pool_id)
+        self.mapping.setdefault(Role.Critic, global_pool_id)
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -222,6 +237,9 @@ class TaskRunner:
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer import Role
+
+        if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
+            return
 
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)

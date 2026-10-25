@@ -38,6 +38,7 @@ install_requires = [
     "ray[default]>=2.41.0",
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "TransferQueue==0.1.8",
     "transformers",
     "wandb",
     "packaging>=20.0",

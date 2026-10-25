@@ -1,0 +1,3 @@
+- name: search_r1_agent
+  _target_: search_r1.llm_agent.async_agent_loop.SearchR1AgentLoop
+  search_timeout: 120.0

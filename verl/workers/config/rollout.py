@@ -27,6 +27,7 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
+    "CheckpointEngineConfig",
     "RolloutConfig",
 ]
 
@@ -92,6 +93,16 @@ class ServerConfig(BaseConfig):
 
 
 @dataclass
+class CheckpointEngineConfig(BaseConfig):
+    """Transport selection for actor-to-rollout weight updates."""
+
+    backend: str = "naive"
+    update_weights_bucket_megabytes: int = 2048
+    engine_kwargs: dict = field(default_factory=dict)
+    custom_backend_module: Optional[str] = None
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -142,6 +153,7 @@ class RolloutConfig(BaseConfig):
 
     multi_stage_wake_up: bool = False
     engine_kwargs: dict = field(default_factory=dict)
+    checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
     calculate_log_probs: bool = False
 

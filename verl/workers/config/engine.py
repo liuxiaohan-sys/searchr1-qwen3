@@ -14,11 +14,15 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from verl.base_config import BaseConfig
+from verl.trainer.config.config import CheckpointConfig
+from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.model import HFModelConfig
+from verl.workers.config.optimizer import OptimizerConfig
 
-__all__ = ["FSDPEngineConfig", "McoreEngineConfig"]
+__all__ = ["FSDPEngineConfig", "McoreEngineConfig", "TrainingWorkerConfig"]
 
 
 @dataclass
@@ -118,3 +122,17 @@ class FSDPEngineConfig(BaseConfig):
 
     def __post_init__(self):
         assert self.strategy in ["fsdp", "fsdp2"], f"strategy {self.strategy} not supported"
+
+
+@dataclass
+class TrainingWorkerConfig(BaseConfig):
+    """Backend-independent inputs used to construct a unified training worker."""
+
+    model_type: str = None
+    model_config: HFModelConfig = None
+    engine_config: BaseConfig = None
+    optimizer_config: OptimizerConfig = None
+    checkpoint_config: CheckpointConfig = None
+    profiler_config: ProfilerConfig = None
+    auto_select_engine_optim_fn: Callable[[HFModelConfig, str], tuple[BaseConfig, OptimizerConfig]] = None
+    extra_context: dict = field(default_factory=dict)

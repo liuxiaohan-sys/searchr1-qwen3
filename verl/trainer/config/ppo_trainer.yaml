@@ -49,6 +49,15 @@ actor_rollout_ref:
     # for huge model, layered summon can save memory (prevent OOM) but make it slower
     layered_summon: False
 
+    # Transport actor weights to the rollout service. `naive` is the colocated
+    # compatibility backend; additional backends register through CheckpointEngineRegistry.
+    checkpoint_engine:
+      _target_: verl.workers.config.CheckpointEngineConfig
+      backend: naive
+      update_weights_bucket_megabytes: 2048
+      engine_kwargs: {}
+      custom_backend_module: null
+
     # for vllm rollout
     # should align with FSDP
     dtype: bfloat16 

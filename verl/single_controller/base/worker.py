@@ -130,6 +130,19 @@ class Worker(WorkerHelper):
         assert mesh_name in self.__collect_dp_rank, f"{mesh_name} is not registered in {self.__class__.__name__}"
         return self.__collect_dp_rank[mesh_name]
 
+    def get_dispatch_collect(self):
+        """Return the dispatch/collect topology registered by this worker."""
+        return {"dispatch_dp_rank": self.__dispatch_dp_rank, "collect_dp_rank": self.__collect_dp_rank}
+
+    def set_dispatch_collect(self, mesh_name: str, dispatch_dp_rank: dict[str, int], collect_dp_rank: dict[str, bool]):
+        """Expose a child worker's topology under ``mesh_name``."""
+        if mesh_name in self.__dispatch_dp_rank or mesh_name in self.__collect_dp_rank:
+            raise ValueError(f"mesh_name {mesh_name} has been registered")
+        if len(dispatch_dp_rank) != 1 or len(collect_dp_rank) != 1:
+            raise ValueError("A composed worker must expose exactly one mesh topology")
+        self.__dispatch_dp_rank[mesh_name] = next(iter(dispatch_dp_rank.values()))
+        self.__collect_dp_rank[mesh_name] = next(iter(collect_dp_rank.values()))
+
     @classmethod
     def env_keys(cls):
         """The keys of the environment variables that are used to configure the Worker."""

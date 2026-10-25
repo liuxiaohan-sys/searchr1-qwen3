@@ -328,7 +328,9 @@ class RayPPOTrainer:
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
         if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
+            assert Role.ActorRollout in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping, (
+                f"{role_worker_mapping.keys()=}"
+            )
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -756,11 +758,14 @@ class RayPPOTrainer:
                     with _timer('step', timing_raw):
                         first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
                         with _timer('gen', timing_raw):
-                            generation_manager.timing_raw = timing_raw
-                            final_gen_batch_output = generation_manager.run_llm_loop(
-                                gen_batch=test_gen_batch,
-                                initial_input_ids=first_input_ids,
-                            )
+                            if self.async_rollout_mode:
+                                final_gen_batch_output = self.async_rollout_manager.generate_sequences(test_gen_batch)
+                            else:
+                                generation_manager.timing_raw = timing_raw
+                                final_gen_batch_output = generation_manager.run_llm_loop(
+                                    gen_batch=test_gen_batch,
+                                    initial_input_ids=first_input_ids,
+                                )
                         
                         test_batch = test_batch.union(final_gen_batch_output)
                         
@@ -803,14 +808,15 @@ class RayPPOTrainer:
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
+        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
             actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
+                cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
-                role=str(Role.ActorRollout),
+                role=str(actor_role),
             )
-            self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
+            self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
         else:
             raise NotImplementedError
 
@@ -822,7 +828,7 @@ class RayPPOTrainer:
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
         # create reference policy if needed
-        if self.use_reference_policy:
+        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
@@ -875,8 +881,11 @@ class RayPPOTrainer:
             self.critic_wg.init_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
-            self.ref_policy_wg.init_model()
+            if str(Role.RefPolicy) in all_wg:
+                self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
+                self.ref_policy_wg.init_model()
+            else:
+                self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
 
         self.rm_wg = None
         if self.use_rm:
@@ -884,7 +893,7 @@ class RayPPOTrainer:
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
+        self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
 
         # create async rollout manager and request scheduler
@@ -1521,11 +1530,15 @@ class RayPPOTrainer:
                             first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
 
                             with _timer('gen', timing_raw):
-                                generation_manager.timing_raw = timing_raw
-                                final_gen_batch_output = generation_manager.run_llm_loop(
-                                    gen_batch=gen_batch,
-                                    initial_input_ids=first_input_ids,
-                                )
+                                if self.async_rollout_mode:
+                                    gen_batch.meta_info["global_steps"] = self.global_steps
+                                    final_gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                else:
+                                    generation_manager.timing_raw = timing_raw
+                                    final_gen_batch_output = generation_manager.run_llm_loop(
+                                        gen_batch=gen_batch,
+                                        initial_input_ids=first_input_ids,
+                                    )
                             
                             # 计算RAG统计指标
                             meta_info = final_gen_batch_output.meta_info
@@ -1650,7 +1663,7 @@ class RayPPOTrainer:
                             # update actor
                             with _timer('update_actor', timing_raw):
                                 # if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
-                                if self.config.do_search:
+                                if self.config.do_search and not self.async_rollout_mode:
                                     batch, metrics = self._create_loss_mask(batch, metrics)
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
