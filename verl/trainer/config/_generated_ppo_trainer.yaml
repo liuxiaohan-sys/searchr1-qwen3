@@ -1,5 +1,5 @@
-# This reference configration yaml is automatically generated via 'scripts/generate_trainer_config.sh'
-# in which it invokes 'python3 scripts/print_cfg.py --cfg job ' to flatten the 'verl/trainer/config/ppo_trainer.yaml' config fields into a single file.
+# This reference configration yaml is automatically generated via 'scripts/generate_trainer_config.sh' or 'scripts/generate_trainer_config.py'
+# It flattens verl/trainer/config/ppo_trainer.yaml into a single file.
 # Do not modify this file directly.
 # The file is usually only for reference and never used.
 
@@ -244,6 +244,12 @@ actor_rollout_ref:
       save_path: ${oc.select:global_profiler.save_path,null}
       tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
     layered_summon: false
+    checkpoint_engine:
+      _target_: verl.workers.config.CheckpointEngineConfig
+      backend: naive
+      update_weights_bucket_megabytes: 2048
+      engine_kwargs: {}
+      custom_backend_module: null
   model:
     _target_: verl.workers.config.HFModelConfig
     path: ~/models/deepseek-llm-7b-chat
@@ -442,6 +448,17 @@ reward_model:
     save_path: ${oc.select:global_profiler.save_path,null}
     tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
   ulysses_sequence_parallel_size: 1
+transfer_queue:
+  enable: false
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: null
+      num_data_storage_units: 8
+      ssd_offload:
+        enabled: false
+        path: null
+        threshold_bytes: 1048576
 custom_reward_function:
   path: null
   name: compute_score
@@ -498,6 +515,18 @@ trainer:
   max_critic_ckpt_to_keep: null
   ray_wait_register_center_timeout: 300
   device: cuda
+  use_v1: false
+  v1:
+    trainer_mode: sync
+    sync: {}
+    colocate_async:
+      num_warmup_batches: 1
+    separate_async:
+      num_warmup_batches: 1
+      parameter_sync_step: 1
+    sampler:
+      max_off_policy_threshold: 8
+      max_off_policy_strategy: drop
   use_legacy_worker_impl: auto
 global_profiler:
   _target_: verl.utils.profiler.ProfilerConfig
@@ -530,3 +559,4 @@ ray_kwargs:
   ray_init:
     num_cpus: null
   timeline_json_file: null
+do_search: true

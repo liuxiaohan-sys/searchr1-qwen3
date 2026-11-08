@@ -26,20 +26,20 @@ with open(os.path.join(version_folder, "verl/version/version")) as f:
 install_requires = [
     "accelerate",
     "codetiming",
-    "datasets",
+    "datasets==3.2.0",
     "dill",
     "hydra-core",
     "numpy<2.0.0",
     "pandas",
     "peft",
-    "pyarrow>=19.0.0",
+    "pyarrow>=19.0.0,<=21.0.0",
     "pybind11",
     "pylatexenc",
     "ray[default]>=2.41.0",
     "torchdata",
-    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "tensordict>=0.10.0,<=0.10.0",
     "TransferQueue==0.1.8",
-    "transformers",
+    "transformers==4.47.1",
     "wandb",
     "packaging>=20.0",
     "tensorboard",
@@ -53,9 +53,9 @@ PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
-VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.7.3,<=0.9.1"]
+VLLM_REQUIRES = ["tensordict>=0.10.0,<=0.10.0", "vllm>=0.7.3,<=0.9.1"]
 SGLANG_REQUIRES = [
-    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "tensordict>=0.10.0,<=0.10.0",
     "sglang[srt,openai]==0.5.2",
     "torch==2.8.0",
 ]
@@ -88,6 +88,7 @@ setup(
     author="Bytedance - Seed - MLSys",
     author_email="zhangchi.usc1992@bytedance.com, gmsheng@connect.hku.hk",
     description="verl: Volcano Engine Reinforcement Learning for LLM",
+    python_requires=">=3.10,<3.13",
     install_requires=install_requires,
     extras_require=extras_require,
     package_data={

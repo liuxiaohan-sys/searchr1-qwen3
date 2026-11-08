@@ -1,5 +1,5 @@
-# This reference configration yaml is automatically generated via 'scripts/generate_trainer_config.sh'
-# in which it invokes 'python3 scripts/print_cfg.py --cfg job --config-name=ppo_megatron_trainer.yaml' to flatten the 'verl/trainer/config/ppo_megatron_trainer.yaml' config fields into a single file.
+# This reference configration yaml is automatically generated via 'scripts/generate_trainer_config.sh' or 'scripts/generate_trainer_config.py'
+# It flattens verl/trainer/config/ppo_megatron_trainer.yaml into a single file.
 # Do not modify this file directly.
 # The file is usually only for reference and never used.
 
@@ -462,6 +462,17 @@ reward_model:
     override_transformer_config: ${oc.select:actor_rollout_ref.actor.megatron.override_transformer_config,{}}
     use_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.use_mbridge,False}
   load_weight: true
+transfer_queue:
+  enable: false
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: null
+      num_data_storage_units: 8
+      ssd_offload:
+        enabled: false
+        path: null
+        threshold_bytes: 1048576
 custom_reward_function:
   path: null
   name: compute_score
@@ -516,6 +527,19 @@ trainer:
   ray_wait_register_center_timeout: 300
   device: cuda
   rollout_data_dir: null
+  use_v1: false
+  v1:
+    trainer_mode: sync
+    sync: {}
+    colocate_async:
+      num_warmup_batches: 1
+    separate_async:
+      num_warmup_batches: 1
+      parameter_sync_step: 1
+    sampler:
+      max_off_policy_threshold: 8
+      max_off_policy_strategy: drop
+  use_legacy_worker_impl: auto
 global_profiler:
   _target_: verl.utils.profiler.ProfilerConfig
   tool: null

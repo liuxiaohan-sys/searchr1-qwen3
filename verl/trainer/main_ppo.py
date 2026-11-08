@@ -17,6 +17,8 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+from datetime import datetime
+from pprint import pprint
 
 import hydra
 import ray
@@ -31,7 +33,6 @@ from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
 
-from datetime import datetime
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -40,7 +41,32 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
-    run_ppo(config)
+    validate_execution_mode(config)
+    task_runner_class = TaskRunnerV1 if config.trainer.get("use_v1", False) else TaskRunner
+    run_ppo(config, task_runner_class=task_runner_class)
+
+
+def validate_execution_mode(config) -> None:
+    """Validate the orthogonal trainer/worker migration switches."""
+    use_v1 = bool(config.trainer.get("use_v1", False))
+    worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+    if worker_impl not in {"auto", "enable", "disable"}:
+        raise ValueError(f"Invalid use_legacy_worker_impl: {worker_impl}")
+    if use_v1 and worker_impl != "disable":
+        raise ValueError(
+            "trainer.use_v1=true requires trainer.use_legacy_worker_impl=disable; "
+            "set trainer.use_v1=false to use the preserved legacy worker path"
+        )
+    if use_v1:
+        from verl.trainer.ppo.v1 import get_trainer_cls
+
+        mode = config.trainer.v1.trainer_mode
+        get_trainer_cls(mode)
+        if mode == "separate_async" and config.actor_rollout_ref.rollout.checkpoint_engine.backend == "naive":
+            raise ValueError(
+                "separate_async requires a standalone checkpoint transport; "
+                "set actor_rollout_ref.rollout.checkpoint_engine.backend to a registered NCCL/NIXL/HCCL plugin"
+            )
 
 
 # Define a function to run the PPO-like training process
@@ -96,8 +122,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
-class TaskRunner:
+class TaskRunnerCore:
     """Ray remote class for executing distributed PPO training tasks.
 
     This class encapsulates the main training logic and runs as a Ray remote actor
@@ -173,9 +198,10 @@ class TaskRunner:
             else:
                 raise NotImplementedError
         elif use_legacy_worker_impl == "disable":
-            from verl.workers.roles import CriticWorker
+            from verl.workers.engine_workers import TrainingWorker
 
-            print("Using new worker implementation")
+            CriticWorker = TrainingWorker
+            print("Using unified TrainingWorker for critic")
         else:
             raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
@@ -245,8 +271,8 @@ class TaskRunner:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
-    def run(self, config):
-        """Execute the main PPO training workflow.
+    def build_trainer(self, config):
+        """Build the PPO runtime without selecting its control loop.
 
         This method sets up the distributed training environment, initializes
         workers, datasets, and reward functions, then starts the training process.
@@ -336,8 +362,171 @@ class TaskRunner:
         # Initialize the workers of the trainer.
         trainer.init_workers()
 
-        # Start the training process.
-        trainer.fit()
+        return trainer
+
+    def run(self, config):
+        """Execute the preserved V0 control flow."""
+        self.build_trainer(config).fit()
+
+
+TaskRunner = ray.remote(num_cpus=1)(TaskRunnerCore)
+
+
+@ray.remote(num_cpus=1)
+class TaskRunnerV1(TaskRunnerCore):
+    """V1 entry point kept separate from the preserved V0 TaskRunner."""
+
+    def run(self, config):
+        validate_execution_mode(config)
+        import uuid
+
+        import numpy as np
+        import transfer_queue as tq
+
+        from verl import DataProto
+        from verl.checkpoint_engine import CheckpointEngineManager
+        from verl.trainer.ppo.v1 import (
+            AgentLoopManagerTQ,
+            ReplayBuffer,
+            ReplayBufferAsync,
+            RewardLoopManager,
+            TransferQueueAdapter,
+            get_trainer_cls,
+        )
+        from verl.utils import tensordict_utils as tu
+
+        trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
+        trainer_mode = config.trainer.v1.trainer_mode
+        pprint(OmegaConf.to_container(config, resolve=True))
+        config.transfer_queue.enable = True
+        tq.init(config.transfer_queue)
+        runtime = super().build_trainer(config)
+        agent_loop = AgentLoopManagerTQ(
+            config=config,
+            worker_group=None if trainer_mode == "separate_async" else runtime.actor_rollout_wg,
+            rm_wg=runtime.rm_wg,
+            queue_client=tq,
+        )
+        checkpoint_manager = CheckpointEngineManager(
+            config.actor_rollout_ref.rollout.checkpoint_engine,
+            runtime.actor_rollout_wg,
+            agent_loop._manager.rollout_replicas,
+        )
+
+        def reward_fn(batch_td):
+            result = runtime.reward_fn(DataProto.from_tensordict(batch_td), return_dict=True)
+            if isinstance(result, dict):
+                return result.get("reward_tensor", result.get("token_level_scores"))
+            return result
+
+        replay_kwargs = {
+            "timeout": config.trainer.v1.sync.get("replay_timeout", 600),
+        }
+        if trainer_mode == "sync":
+            replay_buffer = ReplayBuffer(**replay_kwargs)
+            mode_kwargs = {}
+        else:
+            replay_buffer = ReplayBufferAsync(
+                **replay_kwargs,
+                max_off_policy_threshold=config.trainer.v1.sampler.max_off_policy_threshold,
+                strategy=config.trainer.v1.sampler.max_off_policy_strategy,
+            )
+            mode_config = config.trainer.v1[trainer_mode]
+            mode_kwargs = {
+                "num_warmup_batches": mode_config.num_warmup_batches,
+                "parameter_sync_step": mode_config.get("parameter_sync_step", 1),
+            }
+        trainer = trainer_cls(
+            config=config,
+            actor_wg=runtime.actor_rollout_wg,
+            critic_wg=runtime.critic_wg if runtime.use_critic else None,
+            ref_wg=runtime.ref_policy_wg if runtime.use_reference_policy else None,
+            queue=TransferQueueAdapter(tq),
+            replay_buffer=replay_buffer,
+            checkpoint_manager=checkpoint_manager,
+            reward_loop_manager=RewardLoopManager(reward_fn=reward_fn),
+            validation_fn=runtime._validate,
+            **mode_kwargs,
+        )
+        trainer.init()
+        resumed_step = 0
+        if config.trainer.resume_mode != "disable":
+            resume_root = (
+                config.trainer.resume_from_path
+                if config.trainer.resume_mode == "resume_path" and config.trainer.resume_from_path
+                else config.trainer.default_local_dir
+            )
+            resumed_step = trainer.load_checkpoint(resume_root)
+        try:
+            def prepare_prompts(raw_batch, request_step, weight_version):
+                batch = DataProto.from_single_dict(raw_batch)
+                if "uid" not in batch.non_tensor_batch:
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [uuid.uuid4().hex for _ in range(len(batch))], dtype=object
+                    )
+                prompt_td = runtime._get_gen_batch(batch).to_tensordict()
+                tu.assign_non_tensor(
+                    prompt_td, global_steps=request_step, weight_version=weight_version
+                )
+                return prompt_td, len(batch)
+
+            global_steps = resumed_step + 1
+            if trainer_mode == "sync":
+                batch_iterator = iter(runtime.train_dataloader)
+                while global_steps <= runtime.total_training_steps:
+                    try:
+                        raw_batch = next(batch_iterator)
+                    except StopIteration:
+                        break
+                    prompt_td, batch_size = prepare_prompts(
+                        raw_batch, global_steps, max(global_steps - 1, resumed_step)
+                    )
+                    agent_loop.generate_sequences(prompt_td)
+                    trainer.step(global_steps=global_steps, partition_id="train", batch_size=batch_size)
+                    if config.trainer.save_freq > 0 and global_steps % config.trainer.save_freq == 0:
+                        trainer.save_checkpoint(config.trainer.default_local_dir, global_steps)
+                    if config.trainer.test_freq > 0 and global_steps % config.trainer.test_freq == 0:
+                        trainer.validate()
+                    global_steps += 1
+            else:
+                from collections import deque
+
+                batch_iterator = iter(runtime.train_dataloader)
+                pending = deque()
+                request_step = global_steps
+                published_version = resumed_step
+
+                def submit_next():
+                    nonlocal request_step
+                    try:
+                        raw_batch = next(batch_iterator)
+                    except StopIteration:
+                        return False
+                    prompt_td, batch_size = prepare_prompts(raw_batch, request_step, published_version)
+                    trainer.submit_rollout(agent_loop, prompt_td)
+                    pending.append(batch_size)
+                    request_step += 1
+                    return True
+
+                for _ in range(trainer.num_warmup_batches):
+                    if not submit_next():
+                        break
+                while pending and global_steps <= runtime.total_training_steps:
+                    batch_size = pending.popleft()
+                    trainer.step(global_steps=global_steps, partition_id="train", batch_size=batch_size)
+                    if trainer.should_sync_weights(global_steps):
+                        published_version = global_steps
+                    if config.trainer.save_freq > 0 and global_steps % config.trainer.save_freq == 0:
+                        trainer.save_checkpoint(config.trainer.default_local_dir, global_steps)
+                    if config.trainer.test_freq > 0 and global_steps % config.trainer.test_freq == 0:
+                        trainer.validate()
+                    global_steps += 1
+                    submit_next()
+        finally:
+            if trainer_mode != "sync":
+                trainer.close()
+            checkpoint_manager.close()
+            tq.close()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):

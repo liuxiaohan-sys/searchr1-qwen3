@@ -1,7 +1,7 @@
 import logging
 import os
-from functools import partial
 from copy import deepcopy
+from functools import partial
 from typing import Any, Optional
 
 import torch
@@ -15,7 +15,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.data_protocol_adapter import dataproto_to_tensordict, tensordict_to_dataproto
+from verl.utils.data_protocol_adapter import dataproto_to_tensordict
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -37,7 +37,7 @@ def _mean_metrics(outputs: list[TensorDict]) -> dict[str, float]:
         for key, value in metrics.items():
             if isinstance(value, torch.Tensor):
                 value = value.detach().float().mean().item()
-            if isinstance(value, (int, float)):
+            if isinstance(value, int | float):
                 values.setdefault(key, []).append(float(value))
     return {key: sum(items) / len(items) for key, items in values.items()}
 
@@ -69,7 +69,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             )
         self.profiler_config = config.profiler_config
         tool_config = self.profiler_config.tool_config if self.profiler_config is not None else None
-        DistProfilerExtension.__init__(self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=tool_config))
+        DistProfilerExtension.__init__(
+            self,
+            DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=tool_config),
+        )
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=config.model_type,
             backend=self.engine_config.strategy,
@@ -103,12 +106,30 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def train_batch(self, data: TensorDict, step_scheduler: bool = True):
         if self.loss_fn is None:
             raise RuntimeError("set_loss_fn must be called before train_batch")
+        mini_batch_size = int(tu.get_non_tensor_data(data, "mini_batch_size", data.batch_size[0]))
+        epochs = int(tu.get_non_tensor_data(data, "epochs", 1))
+        if mini_batch_size <= 0 or epochs <= 0:
+            raise ValueError("mini_batch_size and epochs must be positive")
+        mini_batch_size = min(mini_batch_size, data.batch_size[0])
+        engine_outputs = []
         with self.engine.train_mode():
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            for _ in range(epochs):
+                indices = torch.randperm(data.batch_size[0])
+                for start in range(0, data.batch_size[0], mini_batch_size):
+                    mini_batch = tu.index_select_tensor_dict(data, indices[start : start + mini_batch_size])
+                    engine_outputs.append(self.engine.train_batch(mini_batch, loss_function=self.loss_fn))
         if self.engine.is_mp_src_rank_with_outputs():
+            metric_values = {}
+            for output in engine_outputs:
+                for key, value in output.get("metrics", {}).items():
+                    if isinstance(value, torch.Tensor):
+                        value = value.detach().float().mean().item()
+                    if isinstance(value, int | float):
+                        metric_values.setdefault(key, []).append(float(value))
+            metrics = {key: sum(values) / len(values) for key, values in metric_values.items()}
             if step_scheduler:
-                output.setdefault("metrics", {})["lr"] = self.engine.lr_scheduler_step()
-            return tu.get_tensordict(output.get("model_output", {}), {"metrics": output["metrics"]}).cpu()
+                metrics["lr"] = self.engine.lr_scheduler_step()
+            return tu.get_tensordict({}, {"metrics": metrics}).cpu()
         return None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -227,7 +248,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
             rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
-            self.rollout = rollout_cls(config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh)
+            self.rollout = rollout_cls(
+                config=rollout_config,
+                model_config=model_config,
+                device_mesh=rollout_device_mesh,
+            )
             self.base_sync_done = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             checkpoint_config = rollout_config.checkpoint_engine
@@ -241,19 +266,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
-        tensor_data = left_right_2_no_padding(dataproto_to_tensordict(data))
+        is_legacy = isinstance(data, DataProto)
+        tensor_data = left_right_2_no_padding(dataproto_to_tensordict(data)) if is_legacy else data
         output = self.ref.infer_batch(tensor_data)
         if output is None:
             return None
+        if not is_legacy:
+            return output.cpu()
         log_probs = no_padding_2_padding(output["log_probs"], tensor_data)
         return DataProto.from_dict(tensors={"ref_log_prob": log_probs.float()})
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_log_prob(self, data: DataProto):
-        tensor_data = left_right_2_no_padding(dataproto_to_tensordict(data))
+        is_legacy = isinstance(data, DataProto)
+        tensor_data = left_right_2_no_padding(dataproto_to_tensordict(data)) if is_legacy else data
         output = self.actor.infer_batch(tensor_data)
         if output is None:
             return None
+        if not is_legacy:
+            return output.cpu()
         tensors = {"old_log_probs": no_padding_2_padding(output["log_probs"], tensor_data).float()}
         entropy = output.get("entropy")
         if entropy is not None:
@@ -262,6 +293,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):
+        if not isinstance(data, DataProto):
+            output = self.actor.train_batch(data, step_scheduler=True)
+            return output.cpu() if output is not None else None
         # The old PPO worker performs ``ppo_epochs`` passes over minibatches. A
         # single Engine.train_batch call silently changed this contract, so keep
         # the loop at the RPC boundary until the V1 trainer owns batching.
@@ -291,6 +325,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         return self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
+    def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        """Run checkpoint transport lifecycle methods on actor ranks."""
+        return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def sleep(self):

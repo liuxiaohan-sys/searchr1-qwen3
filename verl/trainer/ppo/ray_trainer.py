@@ -60,6 +60,8 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils import tensordict_utils as tu
+from verl.workers.roles.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
@@ -824,6 +826,25 @@ class RayPPOTrainer:
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            self._unified_critic = self.config.trainer.get("use_legacy_worker_impl", "auto") == "disable"
+            if self._unified_critic:
+                from verl.workers.config import TrainingWorkerConfig
+
+                original_critic_cfg = critic_cfg
+                engine_config = critic_cfg.engine
+                if not getattr(engine_config, "strategy", None):
+                    engine_config = critic_cfg.model.fsdp_config
+                    engine_config.strategy = critic_cfg.strategy
+                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+                critic_cfg = TrainingWorkerConfig(
+                    model_type="value_model",
+                    model_config=original_critic_cfg.model_config,
+                    engine_config=engine_config,
+                    optimizer_config=original_critic_cfg.optim,
+                    checkpoint_config=original_critic_cfg.checkpoint,
+                    profiler_config=original_critic_cfg.profiler,
+                )
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
@@ -878,7 +899,14 @@ class RayPPOTrainer:
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
-            self.critic_wg.init_model()
+            if self._unified_critic:
+                from functools import partial
+                from verl.workers.roles.utils.losses import value_loss
+
+                self.critic_wg.reset()
+                self.critic_wg.set_loss_fn(partial(value_loss, config=original_critic_cfg))
+            else:
+                self.critic_wg.init_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
             if str(Role.RefPolicy) in all_wg:
@@ -895,6 +923,38 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
+
+    def _compute_critic_values(self, batch: DataProto) -> DataProto:
+        """Bridge V0 DataProto batches to the unified critic TensorDict API."""
+        if not getattr(self, "_unified_critic", False):
+            return self.critic_wg.compute_values(batch)
+        batch_td = left_right_2_no_padding(batch.to_tensordict())
+        tu.assign_non_tensor(batch_td, compute_loss=False)
+        output = self.critic_wg.infer_batch(batch_td)
+        if hasattr(output, "get") and not hasattr(output, "keys"):
+            output = output.get()
+        values = no_padding_2_padding(tu.get(output, "values"), batch_td)
+        return DataProto.from_tensordict(tu.get_tensordict({"values": values.float()}))
+
+    def _update_critic_worker(self, batch: DataProto) -> DataProto:
+        """Bridge V0 critic updates to TrainingWorker while V1 owns no batching yet."""
+        if not getattr(self, "_unified_critic", False):
+            return self.critic_wg.update_critic(batch)
+        batch_td = left_right_2_no_padding(batch.to_tensordict())
+        tu.assign_non_tensor(
+            batch_td,
+            global_batch_size=self.config.critic.ppo_mini_batch_size,
+            mini_batch_size=self.config.critic.ppo_mini_batch_size,
+            epochs=self.config.critic.ppo_epochs,
+            seed=self.config.critic.data_loader_seed,
+            dataloader_kwargs={"shuffle": self.config.critic.shuffle},
+            compute_loss=True,
+        )
+        output = self.critic_wg.train_batch(batch_td)
+        if hasattr(output, "get") and not hasattr(output, "keys"):
+            output = output.get()
+        metrics = tu.unwrap_non_tensor_data(output.get("metrics", {}))
+        return DataProto(meta_info={"metrics": {f"critic/{key}": value for key, value in metrics.items()}})
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -1611,7 +1671,7 @@ class RayPPOTrainer:
                         # compute values
                         if self.use_critic:
                             with _timer('values', timing_raw):
-                                values = self.critic_wg.compute_values(batch)
+                                values = self._compute_critic_values(batch)
                                 batch = batch.union(values)
 
                         with _timer('adv', timing_raw):
@@ -1654,7 +1714,7 @@ class RayPPOTrainer:
                         # update critic
                         if self.use_critic:
                             with _timer('update_critic', timing_raw):
-                                critic_output = self.critic_wg.update_critic(batch)
+                                critic_output = self._update_critic_worker(batch)
                             critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                             metrics.update(critic_output_metrics)
 

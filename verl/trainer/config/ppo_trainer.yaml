@@ -30,6 +30,9 @@ defaults:
   # Reward model config.
   - reward_model@reward_model: dp_reward_model
 
+  # TransferQueue configuration used by the V1 trainer.
+  - transfer_queue@transfer_queue: transfer_queue
+
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
   - _self_
@@ -235,6 +238,33 @@ trainer:
 
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda
+
+  # Use the unified V1 trainer control flow. Keep false until the V1
+  # TransferQueue/replay-buffer loop is fully enabled for Search-R1.
+  use_v1: false
+
+  # Unified V1 trainer settings.
+  v1:
+
+    # Trainer mode: "sync", "colocate_async", or "separate_async".
+    trainer_mode: sync
+
+    # Synchronous trainer settings.
+    sync: {}
+
+    # Asynchronous trainer with colocated training and rollout workers.
+    colocate_async:
+      num_warmup_batches: 1
+
+    # Asynchronous trainer with separate training and rollout workers.
+    separate_async:
+      num_warmup_batches: 1
+      parameter_sync_step: 1
+
+    # Replay sampling and off-policy controls shared by async modes.
+    sampler:
+      max_off_policy_threshold: 8
+      max_off_policy_strategy: drop
 
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
