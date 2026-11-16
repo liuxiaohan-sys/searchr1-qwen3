@@ -77,13 +77,19 @@ class PPOTrainerColocateAsync(PPOTrainerAsync):
             raise ValueError("colocate_async requires checkpoint_engine.backend='naive'")
 
     def step(self, *, global_steps: int, partition_id: str, batch_size: int):
+        # Do not suspend rollout while sample() is still waiting: in-flight
+        # agent/tool turns may need another vLLM request to finish the batch.
+        meta, metrics = self.replay_buffer.sample(global_steps, partition_id, batch_size)
         if self.checkpoint_manager is not None:
             self._wait(self.checkpoint_manager.abort_replicas())
             self._wait(self.checkpoint_manager.sleep_replicas())
-        result = super().step(global_steps=global_steps, partition_id=partition_id, batch_size=batch_size)
-        if self.checkpoint_manager is not None:
-            self._wait(self.checkpoint_manager.wake_up_replicas())
-        return result
+        try:
+            batch, train_metrics = self.train_kv_batch(meta, global_steps=global_steps)
+            metrics.update(train_metrics)
+            return batch, metrics
+        finally:
+            if self.checkpoint_manager is not None:
+                self._wait(self.checkpoint_manager.wake_up_replicas())
 
 
 class PPOTrainerSeparateAsync(PPOTrainerAsync):

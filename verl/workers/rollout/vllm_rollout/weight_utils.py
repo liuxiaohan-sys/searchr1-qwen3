@@ -1,5 +1,7 @@
 """Weight iterator adapters shared by vLLM rollout implementations."""
 
+import torch
+
 
 async def load_vllm_weights(model, weights) -> int | None:
     """Load sync weights or consume an async transport stream without prefetch."""
@@ -11,6 +13,11 @@ async def load_vllm_weights(model, weights) -> int | None:
         # The tensor may alias a reusable NCCL receive buffer. The synchronous
         # loader must finish before requesting the next item from the stream.
         model.load_weights(iter(((name, tensor),)))
+        # Transport buckets are reused as soon as the async iterator advances.
+        # vLLM loaders may enqueue copies on a different CUDA stream, so make
+        # completion explicit before allowing the receiver to reuse the buffer.
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
         loaded += 1
     return loaded
 

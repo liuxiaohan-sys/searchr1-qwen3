@@ -380,8 +380,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def wake_up(self):
-        """Legacy alias retained while RayPPOTrainer is migrated to V1."""
-        await self.update_weights(global_steps=None, mode="naive")
+        """Restore inference resources without publishing another weight version."""
+        if self.rollout is None:
+            return
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights", "kv_cache"])
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     def get_zeromq_address(self):

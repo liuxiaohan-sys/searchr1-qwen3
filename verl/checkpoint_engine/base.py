@@ -142,6 +142,7 @@ class CheckpointEngineManager:
         self.replicas = list(replicas or [])
         self._last_submitted_version: int | None = None
         self._last_committed_version: int | None = None
+        self._update_in_progress = False
 
     def add_replicas(self, replicas):
         self.replicas.extend(replicas)
@@ -164,15 +165,34 @@ class CheckpointEngineManager:
         await asyncio.gather(*operations)
 
     def _build_process_group(self):
-        """Prepare and connect actor and standalone rollout transport ranks."""
-        import ray
+        """Prepare and connect actor and standalone rollout transport ranks.
 
-        from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+        Standalone rollout actors are not ``ActorRolloutRefWorker`` instances,
+        so wrapping their handles in a RayWorkerGroup cannot bind the latter's
+        checkpoint methods.  Invoke the explicit receiver API implemented by
+        the rollout actor instead.
+        """
+        import ray
 
         workers = [worker for replica in self.replicas for worker in getattr(replica, "workers", [])]
         if not workers:
             raise RuntimeError(f"Checkpoint backend {self.backend!r} requires rollout worker handles")
-        rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=None))
+
+        class RolloutWorkerGroup:
+            def __init__(self, handles):
+                self.workers = handles
+                self.world_size = len(handles)
+
+            def execute_checkpoint_engine(self, methods, *args, **kwargs):
+                return [
+                    worker.execute_checkpoint_engine.remote(method, *args, **kwargs)
+                    for worker, method in zip(self.workers, methods, strict=True)
+                ]
+
+            def update_weights(self, **kwargs):
+                return [worker.update_weights.remote(None, **kwargs) for worker in self.workers]
+
+        rollout = RolloutWorkerGroup(workers)
         backend_cls = CheckpointEngineRegistry.get(self.backend)
         actor_size, rollout_size = self.actor_wg.world_size, rollout.world_size
         metadata = ray.get(
@@ -195,40 +215,80 @@ class CheckpointEngineManager:
         return rollout
 
     async def update_weights(self, global_steps: int | None = None):
+        if self._update_in_progress:
+            raise RuntimeError("A checkpoint weight update is already in progress")
         if global_steps is not None:
-            if self._last_submitted_version is not None and global_steps <= self._last_submitted_version:
+            if self._last_committed_version is not None and global_steps <= self._last_committed_version:
                 raise ValueError(
-                    f"Weight version must increase monotonically: {global_steps} <= {self._last_submitted_version}"
+                    f"Weight version must increase monotonically: {global_steps} <= {self._last_committed_version}"
                 )
             self._last_submitted_version = global_steps
-        if self.backend != "naive":
-            await self.abort_replicas()
-            has_worker_handles = any(getattr(replica, "workers", None) for replica in self.replicas)
-            rollout = self._build_process_group() if has_worker_handles else None
-        result = self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-        actor_result = await result if inspect.isawaitable(result) else result
-        if isinstance(actor_result, list | tuple) and any(
-            inspect.isawaitable(item) for item in actor_result
-        ):
-            actor_result = await asyncio.gather(*actor_result)
-        if self.backend != "naive":
-            if rollout is not None:
-                import ray
 
-                rollout_results = rollout.update_weights(global_steps=global_steps)
-                ray.get(rollout_results)
-                ray.get(
-                    self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
-                    + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-                )
+        self._update_in_progress = True
+        rollout = None
+        prepared = False
+        try:
+            if self.backend != "naive":
+                await self.abort_replicas()
+                has_worker_handles = any(getattr(replica, "workers", None) for replica in self.replicas)
+                rollout = self._build_process_group() if has_worker_handles else None
+                prepared = rollout is not None
+
+            # Submit both sides before waiting: collectives cannot complete if
+            # the sender is awaited before receivers enter the broadcast.
+            actor_call = self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
+            if self.backend != "naive":
+                if rollout is not None:
+                    rollout_call = rollout.update_weights(global_steps=global_steps)
+                else:
+                    rollout_call = [
+                        replica.update_weights(global_steps=global_steps, mode=self.backend)
+                        for replica in self.replicas
+                    ]
             else:
-                # Lightweight plugin/test replicas may expose a direct update API.
-                await asyncio.gather(
-                    *(replica.update_weights(global_steps=global_steps, mode=self.backend) for replica in self.replicas)
-                )
-            await self.wake_up_replicas()
-        self._last_committed_version = global_steps
-        return actor_result
+                rollout_call = []
+
+            actor_result, _ = await asyncio.gather(
+                self._resolve_calls(actor_call), self._resolve_calls(rollout_call)
+            )
+            self._last_committed_version = global_steps
+            return actor_result
+        finally:
+            try:
+                if prepared:
+                    import ray
+
+                    await asyncio.to_thread(
+                        ray.get,
+                        self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
+                        + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size),
+                    )
+            finally:
+                if self.backend != "naive":
+                    await self.wake_up_replicas()
+                self._update_in_progress = False
+                if self._last_committed_version != global_steps:
+                    self._last_submitted_version = self._last_committed_version
+
+    @staticmethod
+    async def _resolve_calls(calls):
+        """Resolve coroutines and Ray ObjectRefs without blocking the event loop."""
+        if calls is None:
+            return None
+        if inspect.isawaitable(calls):
+            return await calls
+        if isinstance(calls, list | tuple):
+            if any(inspect.isawaitable(item) for item in calls):
+                return await asyncio.gather(*calls)
+            if calls:
+                try:
+                    import ray
+
+                    if all(isinstance(item, ray.ObjectRef) for item in calls):
+                        return await asyncio.to_thread(ray.get, calls)
+                except (ImportError, TypeError):
+                    pass
+        return calls
 
     async def wait_for_weight_update(self):
         return self._last_committed_version

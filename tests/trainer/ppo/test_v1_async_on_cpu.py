@@ -58,13 +58,23 @@ def test_async_modes_validate_transport_boundaries():
 
 def test_colocate_step_quiesces_and_resumes_replicas(monkeypatch):
     manager = CheckpointManager("naive")
-    trainer = PPOTrainerColocateAsync(checkpoint_manager=manager)
+    events = manager.events
+
+    class Replay:
+        def sample(self, *args):
+            events.append("sample")
+            return "meta", {"sampled": True}
+
+    trainer = PPOTrainerColocateAsync(checkpoint_manager=manager, replay_buffer=Replay())
     monkeypatch.setattr(
-        "verl.trainer.ppo.v1.trainer_async.PPOTrainer.step",
-        lambda self, **kwargs: "trained",
+        trainer,
+        "train_kv_batch",
+        lambda meta, **kwargs: ("batch", {"trained": True}),
     )
-    assert trainer.step(global_steps=1, partition_id="train", batch_size=1) == "trained"
-    assert manager.events == ["abort", "sleep", "wake"]
+    assert trainer.step(global_steps=1, partition_id="train", batch_size=1) == (
+        "batch", {"sampled": True, "trained": True}
+    )
+    assert events == ["sample", "abort", "sleep", "wake"]
 
 
 def test_separate_parameter_sync_period():

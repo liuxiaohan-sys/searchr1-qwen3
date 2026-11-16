@@ -8,6 +8,7 @@ import asyncio
 import socket
 from dataclasses import dataclass
 from typing import AsyncGenerator
+
 import ray
 import ray.util.collective as collective
 import torch
@@ -162,6 +163,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             if offset + meta.chunk_size > self.bucket_size:
                 if previous is not None:
                     await previous.wait()
+                self.cp.cuda.get_current_stream().synchronize()
                 previous = BroadcastOperation(0, self.group_name, send_buf[:offset], {
                     "bucket_meta": bucket_meta, "is_last": False, "length": offset
                 }, self.socket, self.topic)
@@ -171,6 +173,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
             bucket_meta[f"{meta.name}:{meta.chunk_offset}"] = meta
             send_buf[offset : offset + meta.chunk_size] = self.cp.asarray(chunk)
             offset += meta.chunk_size
+        # CuPy copies and Ray NCCL may use unrelated streams.  The collective
+        # must not observe a partially populated final bucket.
+        self.cp.cuda.get_current_stream().synchronize()
         if previous is not None:
             await previous.wait()
         await BroadcastOperation(0, self.group_name, send_buf[:offset], {

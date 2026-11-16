@@ -60,6 +60,7 @@ except ModuleNotFoundError:
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
+from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
@@ -70,10 +71,10 @@ from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 
+from .weight_utils import load_vllm_weights, materialize_async_weights
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-from .weight_utils import load_vllm_weights, materialize_async_weights
 
 # TODO
 # 1. support pp in vllm
@@ -495,6 +496,13 @@ class vLLMAsyncRollout(BaseRollout):
         self.lora_config = (
             {"max_loras": 1, "max_lora_rank": model_config.lora_rank} if model_config.lora_rank > 0 else {}
         )
+        checkpoint_config = config.checkpoint_engine
+        self.checkpoint_engine = CheckpointEngineRegistry.new(
+            checkpoint_config.backend,
+            bucket_size=checkpoint_config.update_weights_bucket_megabytes << 20,
+            is_master=False,
+            **checkpoint_config.engine_kwargs.get(checkpoint_config.backend, {}),
+        )
 
         # https://github.com/vllm-project/vllm/issues/25171
         if config.layered_summon or config.expert_parallel_size > 1:
@@ -591,12 +599,20 @@ class vLLMAsyncRollout(BaseRollout):
         if self.config.free_cache_engine:
             self.inference_engine.sleep(level=self.sleep_level)
 
-    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
+    def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        """Expose the transport lifecycle to the standalone rollout manager."""
+        return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+    async def update_weights(
+        self, weights: Generator[tuple[str, torch.Tensor], None, None] | None = None, **kwargs
+    ):
         """Update the weights of the rollout model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        if weights is None:
+            weights = self.checkpoint_engine.receive_weights(global_steps=kwargs.get("global_steps"))
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_tensors = await materialize_async_weights(weights)
