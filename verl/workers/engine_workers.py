@@ -348,6 +348,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         transports retain the payload for a disaggregated rollout consumer.
         """
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+        if effective_mode != "naive":
+            if self.actor is not None:
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                return await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            if self.rollout is None:
+                raise RuntimeError("NCCL weight update worker has neither actor nor rollout")
+            received = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+            await self.rollout.update_weights(received, global_steps=global_steps)
+            return
+
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param()
         await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
         if effective_mode != "naive":

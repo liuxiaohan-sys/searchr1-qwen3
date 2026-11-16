@@ -68,9 +68,23 @@ def broadcast_pyobj(
         return data
 
 
-def get_named_tensor_buckets(
-    iterable: Iterator[tuple[str, torch.Tensor]], bucket_bytes: int
-) -> Iterator[list[tuple[str, torch.Tensor]]]:
+def get_named_tensor_buckets(iterable, bucket_bytes: int):
+    """Group a synchronous named-tensor iterator into bounded buckets."""
+    if bucket_bytes <= 0:
+        raise ValueError(f"bucket_bytes must be greater than 0, got {bucket_bytes}")
+    current_bucket, current_size = [], 0
+    for name, tensor in iterable:
+        tensor_size = tensor.element_size() * tensor.numel()
+        if current_bucket and current_size + tensor_size > bucket_bytes:
+            yield current_bucket
+            current_bucket, current_size = [], 0
+        current_bucket.append((name, tensor))
+        current_size += tensor_size
+    if current_bucket:
+        yield current_bucket
+
+
+async def async_get_named_tensor_buckets(iterable, bucket_bytes: int):
     """
     Group tensors into buckets based on a specified size in megabytes.
 
@@ -93,7 +107,15 @@ def get_named_tensor_buckets(
 
     current_bucket = []
     current_size = 0
-    for name, tensor in iterable:
+    if hasattr(iterable, "__aiter__"):
+        items = iterable
+    else:
+        async def as_async():
+            for item in iterable:
+                yield item
+
+        items = as_async()
+    async for name, tensor in items:
         tensor_size = tensor.element_size() * tensor.numel()
         if current_size + tensor_size > bucket_bytes:
             if current_bucket:

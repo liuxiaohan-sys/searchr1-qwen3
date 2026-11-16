@@ -73,6 +73,8 @@ from verl.workers.rollout.base import BaseRollout
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+from .weight_utils import load_vllm_weights, materialize_async_weights
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -440,22 +442,25 @@ class vLLMRollout(BaseRollout):
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
+            lora_tensors = await materialize_async_weights(weights)
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_reqest = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",
                 lora_int_id=lora_int_id,
                 lora_path="simon_lora_path",
                 peft_config=asdict(peft_config),
-                lora_tensors=dict(weights),
+                lora_tensors=lora_tensors,
             )
             self.inference_engine.llm_engine.add_lora(lora_reqest)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            logger.info(f"vLLM load LoRA weights, loaded_params: {len(lora_tensors)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            loaded = await load_vllm_weights(model, weights)
+            if loaded is not None:
+                logger.info(f"vLLM streamed weights, loaded_params: {loaded}")
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -594,22 +599,25 @@ class vLLMAsyncRollout(BaseRollout):
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
+            lora_tensors = await materialize_async_weights(weights)
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_reqest = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",
                 lora_int_id=lora_int_id,
                 lora_path="simon_lora_path",
                 peft_config=asdict(peft_config),
-                lora_tensors=dict(weights),
+                lora_tensors=lora_tensors,
             )
             self.inference_engine.worker.add_lora(lora_reqest)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            logger.info(f"vLLM load LoRA weights, loaded_params: {len(lora_tensors)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            loaded = await load_vllm_weights(model, weights)
+            if loaded is not None:
+                logger.info(f"vLLM streamed weights, loaded_params: {loaded}")
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

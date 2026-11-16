@@ -1,9 +1,63 @@
 import asyncio
 import inspect
 from abc import ABC, abstractmethod
-from typing import Any, Generator, Optional
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Generator, Optional
 
 import torch
+
+
+@dataclass
+class TensorMeta:
+    name: str
+    shape: torch.Size
+    dtype: torch.dtype
+    chunk_offset: int
+    chunk_size: int
+    offset: int | None = None
+
+
+async def _ensure_async_iterator(iterator):
+    if hasattr(iterator, "__aiter__"):
+        async for item in iterator:
+            yield item
+    else:
+        for item in iterator:
+            yield item
+
+
+async def split_weight_chunks(weights, bucket_size: int) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:
+    """Split named tensors into byte chunks no larger than a transport bucket."""
+    async for name, weight in _ensure_async_iterator(weights):
+        buffer = weight.contiguous().view(-1).view(torch.uint8)
+        for chunk_offset in range(0, weight.nbytes, bucket_size):
+            chunk_size = min(bucket_size, weight.nbytes - chunk_offset)
+            yield TensorMeta(name, weight.shape, weight.dtype, chunk_offset, chunk_size), buffer[
+                chunk_offset : chunk_offset + chunk_size
+            ]
+
+
+async def merge_weight_chunks(chunks, bucket_size: int):
+    """Reassemble byte chunks emitted by a checkpoint transport."""
+    merge_name = merge_weight = merge_buffer = None
+    merge_offset = 0
+    async for tensor_meta, chunk in chunks:
+        nbytes = tensor_meta.shape.numel() * tensor_meta.dtype.itemsize
+        if nbytes <= bucket_size:
+            yield tensor_meta.name, chunk.view(tensor_meta.dtype).view(tensor_meta.shape)
+            continue
+        if merge_weight is None:
+            merge_name = tensor_meta.name
+            merge_weight = torch.empty(tensor_meta.shape, dtype=tensor_meta.dtype, device=chunk.device)
+            merge_buffer = merge_weight.view(-1).view(torch.uint8)
+            merge_offset = 0
+        assert tensor_meta.name == merge_name and tensor_meta.chunk_offset == merge_offset
+        merge_buffer[merge_offset : merge_offset + tensor_meta.chunk_size] = chunk
+        merge_offset += tensor_meta.chunk_size
+        if merge_offset == nbytes:
+            yield merge_name, merge_weight
+            merge_name = merge_weight = merge_buffer = None
+            merge_offset = 0
 
 
 class CheckpointEngineRegistry:

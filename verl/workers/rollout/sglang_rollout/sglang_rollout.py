@@ -1517,7 +1517,8 @@ class SGLangRollout(BaseRollout):
             - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
         """
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
-        for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+        from .utils import async_get_named_tensor_buckets
+        async for params_batch in async_get_named_tensor_buckets(weights, update_weights_bucket_bytes):
             await sgl_update_weights(
                 engine=self._engine,
                 params_batch=params_batch,
@@ -1603,7 +1604,8 @@ class ServerAdapter(BaseRollout):
             await self._init_server_adapter()
 
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
-        for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+        from .utils import async_get_named_tensor_buckets
+        async for params_batch in async_get_named_tensor_buckets(weights, update_weights_bucket_bytes):
             await sgl_update_weights(
                 engine=self._engine,
                 params_batch=params_batch,
