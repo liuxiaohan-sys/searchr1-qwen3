@@ -811,26 +811,38 @@ class AgentLoopManager:
             self.sleep()
 
     def _initialize_llm_servers(self):
+        rollout_config = self.config.actor_rollout_ref.rollout
         rollout_world_size = (
-            self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
-            * self.config.actor_rollout_ref.rollout.data_parallel_size
-            * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+            rollout_config.tensor_model_parallel_size
+            * rollout_config.data_parallel_size
+            * rollout_config.pipeline_model_parallel_size
         )
-        world_size = (
-            self.worker_group.world_size
-            if self.worker_group
-            else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-        )
+        if self.worker_group:
+            world_size = self.worker_group.world_size
+            rollout_gpus_per_node = self.config.trainer.n_gpus_per_node
+        else:
+            # Separate-async rollout owns a dedicated resource pool.  Prefer
+            # rollout-specific sizing while retaining compatibility with older
+            # configs that only define trainer GPU counts.
+            rollout_gpus_per_node = rollout_config.get(
+                "n_gpus_per_node", self.config.trainer.n_gpus_per_node
+            )
+            rollout_nodes = rollout_config.get("nnodes", self.config.trainer.nnodes)
+            world_size = rollout_gpus_per_node * rollout_nodes
+        if world_size <= 0 or world_size % rollout_world_size != 0:
+            raise ValueError(
+                f"rollout pool world_size={world_size} must be positive and divisible by "
+                f"TP*DP*PP={rollout_world_size}"
+            )
         num_replicas = world_size // rollout_world_size
 
-        rollout_config = self.config.actor_rollout_ref.rollout
         model_config = self.config.actor_rollout_ref.model
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=replica_rank,
                 config=rollout_config,
                 model_config=model_config,
-                gpus_per_node=self.config.trainer.n_gpus_per_node,
+                gpus_per_node=rollout_gpus_per_node,
             )
             for replica_rank in range(num_replicas)
         ]

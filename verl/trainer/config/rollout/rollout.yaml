@@ -7,6 +7,10 @@ name: ???
 # sync: LLM, async: AsyncLLM
 mode: sync
 
+# Dedicated rollout resources for trainer.v1.trainer_mode=separate_async.
+nnodes: 0
+n_gpus_per_node: ${oc.select:trainer.n_gpus_per_node,8}
+
 # Sampling temperature for rollout.
 temperature: 1.0
 
@@ -30,6 +34,9 @@ dtype: bfloat16
 
 # Fraction of GPU memory used by vLLM/SGLang for KV cache.
 gpu_memory_utilization: 0.5
+
+# Optional memory fraction for standalone rollout replicas.
+standalone_gpu_memory_utilization: null
 
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False

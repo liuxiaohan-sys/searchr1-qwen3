@@ -67,6 +67,13 @@ def validate_execution_mode(config) -> None:
                 "separate_async requires a standalone checkpoint transport; "
                 "set actor_rollout_ref.rollout.checkpoint_engine.backend to a registered NCCL/NIXL/HCCL plugin"
             )
+        if mode == "separate_async":
+            rollout = config.actor_rollout_ref.rollout
+            if rollout.get("nnodes", 0) <= 0 or rollout.get("n_gpus_per_node", 0) <= 0:
+                raise ValueError(
+                    "separate_async requires positive actor_rollout_ref.rollout.nnodes "
+                    "and actor_rollout_ref.rollout.n_gpus_per_node"
+                )
 
 
 # Define a function to run the PPO-like training process

@@ -13,7 +13,13 @@ def _config(*, use_v1=False, worker_impl="auto", trainer_mode="sync", checkpoint
                 "use_legacy_worker_impl": worker_impl,
                 "v1": {"trainer_mode": trainer_mode},
             },
-            "actor_rollout_ref": {"rollout": {"checkpoint_engine": {"backend": checkpoint_backend}}},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "nnodes": 1,
+                    "n_gpus_per_node": 1,
+                    "checkpoint_engine": {"backend": checkpoint_backend},
+                }
+            },
         }
     )
 

@@ -125,7 +125,7 @@ class PPOTrainer:
         batch = self.queue.get_tensordict(meta)
         validate_training_tensordict(batch, require_versions=True)
         metrics: dict[str, Any] = {}
-        batch = self._merge(batch, self.actor_wg.compute_log_prob(batch))
+        batch = self.compute_old_log_prob(batch)
         if self.ref_wg is not None:
             batch = self._merge(batch, self.ref_wg.compute_ref_log_prob(batch))
         if self.critic_wg is not None:
@@ -171,6 +171,10 @@ class PPOTrainer:
                 self._wait(self.actor_wg.update_weights(global_steps=global_steps))
         self.queue.clear(meta)
         return batch, metrics
+
+    def compute_old_log_prob(self, batch: TensorDict) -> TensorDict:
+        """Attach the behavior-policy log probabilities used by PPO."""
+        return self._merge(batch, self.actor_wg.compute_log_prob(batch))
 
     def should_sync_weights(self, global_steps: int) -> bool:
         """Return whether this optimizer step publishes a new rollout version."""

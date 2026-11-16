@@ -260,6 +260,8 @@ trainer:
     separate_async:
       num_warmup_batches: 1
       parameter_sync_step: 1
+      # Standalone rollout GPUs remain resident while actor training runs.
+      # Configure actor_rollout_ref.rollout.nnodes/n_gpus_per_node to size that pool.
 
     # Replay sampling and off-policy controls shared by async modes.
     sampler:

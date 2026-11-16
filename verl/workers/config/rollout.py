@@ -110,6 +110,10 @@ class RolloutConfig(BaseConfig):
     mode: str = "sync"
     skip_tokenizer_init: bool = True
 
+    # Dedicated rollout pool sizing used by V1 separate_async.
+    nnodes: int = 0
+    n_gpus_per_node: int = 8
+
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
@@ -125,6 +129,7 @@ class RolloutConfig(BaseConfig):
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
+    standalone_gpu_memory_utilization: Optional[float] = None
     ignore_eos: bool = False
     enforce_eager: bool = True
     cudagraph_capture_sizes: Optional[list] = None
