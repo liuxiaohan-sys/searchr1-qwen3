@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from verl.checkpoint_engine import CheckpointEngineManager
+from verl.checkpoint_engine.base import _RolloutWorkerGroup
 
 
 class Actor:
@@ -117,5 +118,95 @@ def test_failed_version_can_retry_and_replica_is_restored():
         assert await manager.wait_for_weight_update() is None
         assert await manager.update_weights(4) == {"synced": True}
         assert await manager.wait_for_weight_update() == 4
+
+    asyncio.run(run())
+
+
+def test_rollout_handle_group_dispatches_topology_per_worker():
+    class RemoteMethod:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def remote(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return len(self.calls)
+
+    class Worker:
+        def __init__(self):
+            self.calls = []
+            self.execute_checkpoint_engine = RemoteMethod(self.calls)
+            self.update_weights = RemoteMethod([])
+
+    workers = [Worker(), Worker()]
+    group = _RolloutWorkerGroup(workers)
+    assert group.execute_checkpoint_engine(
+        method=["init_process_group", "init_process_group"],
+        rank=[1, 2],
+        world_size=[3, 3],
+        master_metadata=["master", "master"],
+    ) == [1, 1]
+    assert workers[0].calls == [(("init_process_group",), {"rank": 1, "world_size": 3, "master_metadata": "master"})]
+    assert workers[1].calls == [(("init_process_group",), {"rank": 2, "world_size": 3, "master_metadata": "master"})]
+
+
+def test_finalize_failure_does_not_commit_version(monkeypatch):
+    from verl.checkpoint_engine import CheckpointEngine, CheckpointEngineRegistry
+
+    @CheckpointEngineRegistry.register("finalize_transport")
+    class FinalizeTransport(CheckpointEngine):
+        async def send_weights(self, weights, global_steps=None): pass
+        async def receive_weights(self, global_steps=None): pass
+
+    async def run():
+        actor, replica = Actor(), Replica()
+        manager = CheckpointEngineManager(SimpleNamespace(backend="finalize_transport"), actor, [replica])
+        rollout = SimpleNamespace(update_weights=lambda **kwargs: [])
+        monkeypatch.setattr(manager, "_build_process_group", lambda: rollout)
+        monkeypatch.setattr(
+            manager,
+            "_finalize_process_group",
+            lambda group: _raise_async(RuntimeError("finalize failed")),
+        )
+        replica.workers = [object()]
+        with pytest.raises(RuntimeError, match="finalize failed"):
+            await manager.update_weights(5)
+        assert await manager.wait_for_weight_update() is None
+        assert manager._last_submitted_version is None
+        assert replica.events[-1] == "wake"
+
+    async def _raise_async(error):
+        raise error
+
+    asyncio.run(run())
+
+
+def test_partial_process_group_initialization_is_finalized(monkeypatch):
+    from verl.checkpoint_engine import CheckpointEngine, CheckpointEngineRegistry
+
+    @CheckpointEngineRegistry.register("partial_init_transport")
+    class PartialInitTransport(CheckpointEngine):
+        async def send_weights(self, weights, global_steps=None): pass
+        async def receive_weights(self, global_steps=None): pass
+
+    async def run():
+        actor, replica = Actor(), Replica()
+        replica.workers = [object(), object()]
+        manager = CheckpointEngineManager(SimpleNamespace(backend="partial_init_transport"), actor, [replica])
+        finalized = []
+
+        def fail_initialization():
+            raise RuntimeError("topology failed")
+
+        async def record_finalize(group):
+            finalized.append(group)
+
+        monkeypatch.setattr(manager, "_build_process_group", fail_initialization)
+        monkeypatch.setattr(manager, "_finalize_process_group", record_finalize)
+        with pytest.raises(RuntimeError, match="topology failed"):
+            await manager.update_weights(6)
+        assert len(finalized) == 1
+        assert finalized[0].workers == replica.workers
+        assert await manager.wait_for_weight_update() is None
+        assert replica.events[-1] == "wake"
 
     asyncio.run(run())

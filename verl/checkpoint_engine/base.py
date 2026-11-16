@@ -100,6 +100,34 @@ class CheckpointEngine(ABC):
         raise NotImplementedError
 
 
+class _RolloutWorkerGroup:
+    """Dispatch checkpoint calls to existing standalone rollout handles."""
+
+    def __init__(self, handles):
+        self.workers = list(handles)
+        self.world_size = len(self.workers)
+
+    def _per_rank(self, value, rank, name):
+        if isinstance(value, list | tuple):
+            if len(value) != self.world_size:
+                raise ValueError(f"rollout argument {name!r} has {len(value)} entries, expected {self.world_size}")
+            return value[rank]
+        return value
+
+    def execute_checkpoint_engine(self, method, *args, **kwargs):
+        """Match RayWorkerGroup's per-rank list dispatch contract."""
+        calls = []
+        for rank, worker in enumerate(self.workers):
+            rank_method = self._per_rank(method, rank, "method")
+            rank_args = tuple(self._per_rank(value, rank, f"arg_{index}") for index, value in enumerate(args))
+            rank_kwargs = {name: self._per_rank(value, rank, name) for name, value in kwargs.items()}
+            calls.append(worker.execute_checkpoint_engine.remote(rank_method, *rank_args, **rank_kwargs))
+        return calls
+
+    def update_weights(self, **kwargs):
+        return [worker.update_weights.remote(None, **kwargs) for worker in self.workers]
+
+
 @CheckpointEngineRegistry.register("naive")
 class ColocatedCheckpointEngine(CheckpointEngine):
     """In-process transport used by colocated synchronous rollout."""
@@ -178,21 +206,7 @@ class CheckpointEngineManager:
         if not workers:
             raise RuntimeError(f"Checkpoint backend {self.backend!r} requires rollout worker handles")
 
-        class RolloutWorkerGroup:
-            def __init__(self, handles):
-                self.workers = handles
-                self.world_size = len(handles)
-
-            def execute_checkpoint_engine(self, methods, *args, **kwargs):
-                return [
-                    worker.execute_checkpoint_engine.remote(method, *args, **kwargs)
-                    for worker, method in zip(self.workers, methods, strict=True)
-                ]
-
-            def update_weights(self, **kwargs):
-                return [worker.update_weights.remote(None, **kwargs) for worker in self.workers]
-
-        rollout = RolloutWorkerGroup(workers)
+        rollout = _RolloutWorkerGroup(workers)
         backend_cls = CheckpointEngineRegistry.get(self.backend)
         actor_size, rollout_size = self.actor_wg.world_size, rollout.world_size
         metadata = ray.get(
@@ -214,6 +228,15 @@ class CheckpointEngineManager:
         )
         return rollout
 
+    async def _finalize_process_group(self, rollout):
+        import ray
+
+        await asyncio.to_thread(
+            ray.get,
+            self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
+            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size),
+        )
+
     async def update_weights(self, global_steps: int | None = None):
         if self._update_in_progress:
             raise RuntimeError("A checkpoint weight update is already in progress")
@@ -226,13 +249,20 @@ class CheckpointEngineManager:
 
         self._update_in_progress = True
         rollout = None
-        prepared = False
+        transport_started = False
         try:
             if self.backend != "naive":
                 await self.abort_replicas()
                 has_worker_handles = any(getattr(replica, "workers", None) for replica in self.replicas)
-                rollout = self._build_process_group() if has_worker_handles else None
-                prepared = rollout is not None
+                if has_worker_handles:
+                    # Retain the handles before any remote prepare call so a
+                    # partially initialized topology can still be finalized.
+                    workers = [
+                        worker for replica in self.replicas for worker in getattr(replica, "workers", [])
+                    ]
+                    rollout = _RolloutWorkerGroup(workers)
+                    transport_started = True
+                    rollout = self._build_process_group()
 
             # Submit both sides before waiting: collectives cannot complete if
             # the sender is awaited before receivers enter the broadcast.
@@ -251,24 +281,20 @@ class CheckpointEngineManager:
             actor_result, _ = await asyncio.gather(
                 self._resolve_calls(actor_call), self._resolve_calls(rollout_call)
             )
-            self._last_committed_version = global_steps
-            return actor_result
         finally:
             try:
-                if prepared:
-                    import ray
-
-                    await asyncio.to_thread(
-                        ray.get,
-                        self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
-                        + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size),
-                    )
+                if transport_started:
+                    await self._finalize_process_group(rollout)
             finally:
                 if self.backend != "naive":
                     await self.wake_up_replicas()
                 self._update_in_progress = False
-                if self._last_committed_version != global_steps:
-                    self._last_submitted_version = self._last_committed_version
+                self._last_submitted_version = self._last_committed_version
+        # A version is committed only after transfer, transport finalization,
+        # and replica restoration all complete successfully.
+        self._last_committed_version = global_steps
+        self._last_submitted_version = global_steps
+        return actor_result
 
     @staticmethod
     async def _resolve_calls(calls):
