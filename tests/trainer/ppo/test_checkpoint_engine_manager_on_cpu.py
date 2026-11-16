@@ -210,3 +210,34 @@ def test_partial_process_group_initialization_is_finalized(monkeypatch):
         assert replica.events[-1] == "wake"
 
     asyncio.run(run())
+
+
+def test_wake_failure_resets_manager_state_and_allows_retry():
+    from verl.checkpoint_engine import CheckpointEngine, CheckpointEngineRegistry
+
+    @CheckpointEngineRegistry.register("wake_retry_transport")
+    class WakeRetryTransport(CheckpointEngine):
+        async def send_weights(self, weights, global_steps=None): pass
+        async def receive_weights(self, global_steps=None): pass
+
+    class FlakyWakeReplica(Replica):
+        wake_attempts = 0
+
+        async def wake_up(self):
+            self.wake_attempts += 1
+            if self.wake_attempts == 1:
+                raise RuntimeError("wake failed")
+            self.events.append("wake")
+
+    async def run():
+        actor, replica = Actor(), FlakyWakeReplica()
+        manager = CheckpointEngineManager(SimpleNamespace(backend="wake_retry_transport"), actor, [replica])
+        with pytest.raises(RuntimeError, match="wake failed"):
+            await manager.update_weights(7)
+        assert not manager._update_in_progress
+        assert manager._last_submitted_version is None
+        assert await manager.wait_for_weight_update() is None
+        assert await manager.update_weights(7) == {"synced": True}
+        assert await manager.wait_for_weight_update() == 7
+
+    asyncio.run(run())

@@ -286,10 +286,15 @@ class CheckpointEngineManager:
                 if transport_started:
                     await self._finalize_process_group(rollout)
             finally:
-                if self.backend != "naive":
-                    await self.wake_up_replicas()
-                self._update_in_progress = False
-                self._last_submitted_version = self._last_committed_version
+                try:
+                    if self.backend != "naive":
+                        await self.wake_up_replicas()
+                finally:
+                    # Local state must never remain wedged if replica recovery
+                    # itself fails.  The version stays uncommitted and may be
+                    # retried after the external replica issue is repaired.
+                    self._update_in_progress = False
+                    self._last_submitted_version = self._last_committed_version
         # A version is committed only after transfer, transport finalization,
         # and replica restoration all complete successfully.
         self._last_committed_version = global_steps
